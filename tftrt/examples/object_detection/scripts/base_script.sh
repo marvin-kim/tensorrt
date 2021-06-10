@@ -1,15 +1,13 @@
 #!/bin/bash
 
 MODEL_NAME=""
-BATCH_SIZE=32
+BATCH_SIZE=8
 
 # Default values of arguments
 USE_XLA=0
 USE_TF32=1
 USE_TFTRT=0
 TFTRT_PRECISION="FP32"
-
-USE_SYNTHETIC_DATA=""
 
 DATA_DIR=""
 MODEL_DIR=""
@@ -22,6 +20,7 @@ do
         MODEL_NAME="${arg#*=}"
         shift # Remove --model_name from processing
         ;;
+
         --use_xla)
         USE_XLA=1
         shift # Remove --use_xla from processing
@@ -80,31 +79,13 @@ fi
 
 # ============== Set model specific parameters ============= #
 
-INPUT_SIZE=224
-PREPROCESS_METHOD="vgg"
-NUM_CLASSES=1001
+MIN_SEGMENT_SIZE=2
+MAX_WORKSPACE_SIZE=$((2**32))
 
 case ${MODEL_NAME} in
-  "inception_v3" | "inception_v4")
-    INPUT_SIZE=299
-    PREPROCESS_METHOD="inception"
-    ;;
-
-  "mobilenet_v1" | "mobilenet_v2")
-    PREPROCESS_METHOD="inception"
-    ;;
-
-  "nasnet_large")
-    INPUT_SIZE=331
-    PREPROCESS_METHOD="inception"
-    ;;
-
-  "nasnet_mobile")
-    PREPROCESS_METHOD="inception"
-    ;;
-
-  "resnet_v1.5_50_tfv2" | "vgg_16" | "vgg_19" )
-    NUM_CLASSES=1000
+  "faster_rcnn_resnet50_coco" | "ssd_mobilenet_v1_fpn_coco")
+    MIN_SEGMENT_SIZE=4
+    MAX_WORKSPACE_SIZE=$((2**24))
     ;;
 esac
 
@@ -120,18 +101,14 @@ echo ""
 echo "[*] USE_XLA: ${USE_XLA}"
 echo "[*] TF_XLA_FLAGS: ${TF_XLA_FLAGS}"
 echo ""
-echo "[*] USE_SYNTHETIC_DATA: ${USE_SYNTHETIC_DATA}"
-echo "[*] USE_SYNTHETIC_DATA_FLAG: ${USE_SYNTHETIC_DATA_FLAG}"
-echo ""
 echo "[*] USE_TF32: ${USE_TF32}"
 echo "[*] NVIDIA_TF32_OVERRIDE: ${NVIDIA_TF32_OVERRIDE}"
 echo ""
 echo "[*] USE_TFTRT: ${USE_TFTRT}"
 echo "[*] TFTRT_PRECISION: ${TFTRT_PRECISION}"
 echo ""
-echo "[*] INPUT_SIZE: ${INPUT_SIZE}"
-echo "[*] PREPROCESS_METHOD: ${PREPROCESS_METHOD}"
-echo "[*] NUM_CLASSES: ${NUM_CLASSES}"
+echo "[*] MAX_WORKSPACE_SIZE: ${MAX_WORKSPACE_SIZE}"
+echo "[*] MIN_SEGMENT_SIZE: ${MIN_SEGMENT_SIZE}"
 echo -e "********************************************************************\n"
 
 # ======================= ARGUMENT VALIDATION ======================= #
@@ -148,6 +125,19 @@ if [[ ! -d ${DATA_DIR} ]]; then
     exit 1
 fi
 
+VAL_DATA_DIR=${DATA_DIR}/val2017
+ANNOTATIONS_DATA_FILE=${DATA_DIR}/annotations/instances_val2017.json
+
+if [[ ! -d ${VAL_DATA_DIR} ]]; then
+    echo "ERROR: the directory \`${VAL_DATA_DIR}\` does not exist."
+    exit 1
+fi
+
+if [[ ! -f ${ANNOTATIONS_DATA_FILE} ]]; then
+    echo "ERROR: the file \`${ANNOTATIONS_DATA_FILE}\` does not exist."
+    exit 1
+fi
+
 # ----------------------  Model Directory --------------
 
 if [[ -z ${MODEL_DIR} ]]; then
@@ -160,7 +150,7 @@ if [[ ! -d ${MODEL_DIR} ]]; then
     exit 1
 fi
 
-INPUT_SAVED_MODEL_DIR=${MODEL_DIR}/${MODEL_NAME}
+INPUT_SAVED_MODEL_DIR=${MODEL_DIR}/${MODEL_NAME}_640_bs${BATCH_SIZE}
 
 if [[ ! -d ${INPUT_SAVED_MODEL_DIR} ]]; then
     echo "ERROR: the directory \`${INPUT_SAVED_MODEL_DIR}\` does not exist."
@@ -180,39 +170,49 @@ fi
 BENCH_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." >/dev/null 2>&1 && pwd )"
 cd ${BENCH_DIR}
 
-# Execute the example
+# Step 1: Installing dependencies if needed:
+python -c "from pycocotools.coco import COCO" > /dev/null 2>&1
+DEPENDENCIES_STATUS=$?
+
+if [[ ${DEPENDENCIES_STATUS} != 0 ]]; then
+    bash install_dependencies.sh
+fi
+
+# Step 2: Execute the example
 
 PREPEND_COMMAND="TF_CPP_MIN_LOG_LEVEL=2 ${TF_XLA_FLAGS} ${NVIDIA_TF32_OVERRIDE}"
 
 if [[ ${USE_TFTRT} == "0" ]]; then
-    COMMAND="${PREPEND_COMMAND} python image_classification.py \
-        --data_dir ${DATA_DIR} \
-        --calib_data_dir ${DATA_DIR} \
+    COMMAND="${PREPEND_COMMAND} python object_detection.py \
         --input_saved_model_dir ${INPUT_SAVED_MODEL_DIR} \
+        --output_saved_model_dir /tmp/$RANDOM \
+        --data_dir ${VAL_DATA_DIR} \
+        --calib_data_dir ${VAL_DATA_DIR} \
+        --annotation_path ${ANNOTATIONS_DATA_FILE} \
         --num_warmup_iterations 100 \
         --display_every 50 \
         ${USE_SYNTHETIC_DATA_FLAG} \
-        --batch_size ${BATCH_SIZE} \
-        --input_size ${INPUT_SIZE} \
-        --preprocess_method ${PREPROCESS_METHOD} \
-        --num_classes ${NUM_CLASSES}"
+        --mode validation \
+        --input_size 640 \
+        --batch_size ${BATCH_SIZE}"
 else
-    COMMAND="${PREPEND_COMMAND} python image_classification.py \
-        --data_dir ${DATA_DIR} \
-        --calib_data_dir ${DATA_DIR} \
+    COMMAND="${PREPEND_COMMAND} python object_detection.py \
         --input_saved_model_dir ${INPUT_SAVED_MODEL_DIR} \
-        --output_saved_model_dir /tmp/${RANDOM}/ \
+        --output_saved_model_dir /tmp/$RANDOM \
+        --data_dir ${VAL_DATA_DIR} \
+        --calib_data_dir ${VAL_DATA_DIR} \
+        --annotation_path ${ANNOTATIONS_DATA_FILE} \
         --num_warmup_iterations 100 \
         --display_every 50 \
         ${USE_SYNTHETIC_DATA_FLAG} \
+        --mode validation \
+        --input_size 640 \
         --batch_size ${BATCH_SIZE} \
         --use_trt \
         --optimize_offline \
         --precision ${TFTRT_PRECISION} \
-        --max_workspace_size $((2**32)) \
-        --input_size ${INPUT_SIZE} \
-        --preprocess_method ${PREPROCESS_METHOD} \
-        --num_classes ${NUM_CLASSES}"
+        --minimum_segment_size ${MIN_SEGMENT_SIZE} \
+        --max_workspace_size ${MAX_WORKSPACE_SIZE}"
 fi
 
 echo -e "**Executing:**\n\n${COMMAND}\n"
